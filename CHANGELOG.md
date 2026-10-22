@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.4 (2026-10-22)
+
+Fix release from the overnight flywheel Wave B corpus expansion hunt (8 real repos, 975 refs, 99 hand-verified findings at 100 percent). 107 tests (93 prior plus 14 new in test/waveb.test.ts), every new test failed against the published 0.1.3 code first. Hunt report: ~/workspace/security-wave/overnight/waves/waveB-actionpin/HUNT.md.
+
+- P-057 (REAL): a local action path with a stray prefix, `uses: $/.github/actions/issues-helper` as shipped 11 times by vitejs/vite, was classified MUTABLE third-party with an empty ref, single-handedly verdicted vite EXPOSED, and was sent to the GitHub API by fix, which parsed owner `$` and repo `.github` and emitted 11 FAIL lines. A uses value whose path is a .github/actions or .github/workflows path behind a malformed prefix is now classified LOCAL, is never resolved against the GitHub API, and still resolves to the composite on disk. The finding carries a note that the prefix is not a valid remote action reference and looks like a local path typo, so the upstream defect stays visible instead of being silently reclassified. On vite the shape is now 11 LOCAL refs with notes and the verdict is driven by the estate's real refs.
+- P-058 (REAL, low): composite action internals inside the scanned repo were never audited in directory scans, so a mutable ref inside a local composite was invisible to the audit and the verdict (vite's .github/actions/issues-helper/action.yml holds 6 pinned actions/github-script refs that were counted nowhere). A directory audit now also scans every action.yml and action.yaml under .github/actions, plus any local action directory a workflow or a scanned composite references, following references without double-counting. Internal steps are inventoried and classified like workflow steps, flagged as composite action refs, and mutable refs inside a composite affect the verdict the same way workflow refs do. On vite the audit total rises from 44 to 50 with the composite's 6 pinned refs inventoried.
+- P-046 (COSMETIC): the audit report carried no composite coverage statement. The report now lists the composite files scanned (a composites field in JSON and a count line in human output), and names any action files found elsewhere in the repo that were not scanned because they sit outside .github/actions and no workflow references them.
+- P-059 (COSMETIC): the fix plan header counted only PIN entries while the body also listed ALREADY-PINNED lines, so header and body disagreed. The header now states both numbers plainly, in the form "N to pin, M already pinned", and the plan JSON carries an alreadyPinned count beside changes.
+
 ## 0.1.3 (2026-10-21)
 
 Fix release from the overnight flywheel Wave A evasion hunt. No new features. 93 tests (72 prior plus 21 new in test/wavea.test.ts), every new test failed against the published 0.1.2 binary first. Hunt report: ~/workspace/security-wave/overnight/waves/waveA-actionpin/HUNT.md.

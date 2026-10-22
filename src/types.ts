@@ -27,6 +27,10 @@ export interface ActionRef {
   rawLine: string;
   /** True when this line is a YAML alias (*name) that reuses an anchored uses value or step defined earlier in the same file. The classification is inherited from the anchor definition; fix mode never rewrites an alias line directly. */
   viaAlias?: boolean;
+  /** Evidence note for a finding whose shape needs explaining in the report itself, for example a malformed local path prefix (P-057). */
+  note?: string;
+  /** True when this ref was found inside a composite action definition (action.yml or action.yaml) scanned as part of a directory audit (P-058). The file in the workflow field is the composite file. */
+  composite?: boolean;
 }
 
 export interface AuditReport {
@@ -46,6 +50,10 @@ export interface AuditReport {
     docker: number;
   };
   workflows: string[];
+  /** Composite action definition files whose internal steps were audited in a directory scan (P-058): files under .github/actions plus any local action directory a workflow or a scanned composite references. Empty for a single-file audit. */
+  composites?: string[];
+  /** Action definition files found in the repo that a directory scan did not audit because they sit outside .github/actions and no workflow or scanned composite references them (P-046). Named so a report never silently implies full composite coverage. */
+  unscannedComposites?: string[];
   checkedAt: string;
 }
 
@@ -69,6 +77,8 @@ export interface PinPlan {
   entries: PinPlanEntry[];
   /** Number of lines that would change (or did change in apply mode). */
   changes: number;
+  /** Number of entries whose status is already-pinned, stated beside changes so the plan header and body agree (P-059). */
+  alreadyPinned?: number;
   checkedAt: string;
 }
 

@@ -9,7 +9,7 @@
  * use fixtures and never touch the network.
  */
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { basename, join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import type {
   ActionRef,
   AuditReport,
@@ -22,7 +22,7 @@ import type {
   Verdict,
 } from "./types.js";
 
-export const VERSION = "0.1.3";
+export const VERSION = "0.1.4";
 
 const SHA_RE = /^[0-9a-f]{40}$/i;
 const VERSION_RE = /^v?\d+(\.\d+){0,2}([-.+][0-9A-Za-z.-]+)?$/i;
@@ -40,8 +40,27 @@ export function classifyRef(ref: string): Classification {
   return "BRANCH";
 }
 
+/**
+ * A uses value whose path looks like a local .github/actions (or
+ * .github/workflows) path behind a malformed prefix, the vitejs/vite
+ * shape `uses: $/.github/actions/issues-helper` (P-057): a stray
+ * character where the dot of the ./ prefix belongs. It names no remote
+ * repository, so it is a local path with a typo, never a third-party
+ * action, and it must never be resolved against the GitHub API.
+ */
+const MALFORMED_LOCAL_RE = /^[^A-Za-z0-9]+\/.github\/(?:actions|workflows)\//;
+
+export function isMalformedLocalUses(uses: string): boolean {
+  if (uses.startsWith("./") || uses.startsWith("../")) return false;
+  return MALFORMED_LOCAL_RE.test(uses);
+}
+
+export function isLocalUses(uses: string): boolean {
+  return uses.startsWith("./") || uses.startsWith("../") || isMalformedLocalUses(uses);
+}
+
 export function ownerTypeFor(action: string, uses: string): OwnerType {
-  if (uses.startsWith("./") || uses.startsWith("../")) return "local";
+  if (isLocalUses(uses)) return "local";
   if (uses.startsWith("docker://")) return "docker";
   const owner = action.split("/")[0]?.toLowerCase() ?? "";
   if (owner === "actions" || owner === "github") return "official";
@@ -75,7 +94,7 @@ function cleanToken(raw: string): string {
 
 /** Split a cleaned uses value into action and ref. */
 function splitUses(uses: string): { action: string; ref: string } {
-  if (uses.startsWith("./") || uses.startsWith("../")) {
+  if (isLocalUses(uses)) {
     return { action: uses, ref: "" };
   }
   if (uses.startsWith("docker://")) {
@@ -151,6 +170,16 @@ function buildActionRef(uses: string, workflow: string, line: number, rawLine: s
   else classification = classifyRef(ref);
   const out: ActionRef = { workflow, line, uses, action, ref, classification, ownerType, rawLine };
   if (viaAlias) out.viaAlias = true;
+  if (isMalformedLocalUses(uses)) {
+    // P-057: classify LOCAL, but keep the defect visible. Silently
+    // reclassifying would hide a real typo in the target repo: the
+    // prefix is not a valid remote reference and reads as a mistyped
+    // local path, which GitHub itself would not run as written.
+    out.note =
+      `Malformed local path: ${uses} is not a valid remote action reference; ` +
+      "the prefix before the .github path is not a repository owner and looks like a local path typo " +
+      "(a local action path starts with ./). Classified LOCAL and never resolved against the GitHub API.";
+  }
   return out;
 }
 
@@ -247,11 +276,114 @@ export function discoverWorkflows(rootPath: string): string[] {
   return [];
 }
 
+/** Recursively collect action.yml and action.yaml files under a directory. */
+function collectActionFiles(dir: string, out: string[], depth = 0): void {
+  if (depth > 12) return;
+  let names: string[];
+  try {
+    names = readdirSync(dir).sort();
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (name === ".git" || name === "node_modules") continue;
+    const p = join(dir, name);
+    let st;
+    try {
+      st = statSync(p);
+    } catch {
+      continue;
+    }
+    if (st.isDirectory()) collectActionFiles(p, out, depth + 1);
+    else if (/^action\.ya?ml$/i.test(name)) out.push(p);
+  }
+}
+
+/** The repo root an audit path points at, for resolving local action paths (which GitHub resolves from the repo root). */
+function repoRootFor(rootPath: string): string {
+  const base = basename(rootPath);
+  if (base === "workflows") return join(rootPath, "..", "..");
+  if (base === ".github") return join(rootPath, "..");
+  return rootPath;
+}
+
+/**
+ * Resolve a local uses path to the action definition file inside the
+ * scanned repo, or null when there is none on disk. A malformed prefix
+ * (P-057) is read as the ./ path it evidently means, so the vite shape
+ * still finds its composite on disk.
+ */
+function resolveLocalActionFile(repoRoot: string, uses: string): string | null {
+  if (!isLocalUses(uses)) return null;
+  const rel = isMalformedLocalUses(uses) ? uses.replace(/^[^A-Za-z0-9]+\//, "./") : uses;
+  const abs = join(repoRoot, rel);
+  try {
+    const st = statSync(abs);
+    if (st.isFile()) return /^action\.ya?ml$/i.test(basename(abs)) ? abs : null;
+    if (st.isDirectory()) {
+      for (const name of ["action.yml", "action.yaml"]) {
+        const cand = join(abs, name);
+        if (existsSync(cand)) return cand;
+      }
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 export function auditWorkflows(rootPath: string): AuditReport {
+  let singleFile = false;
+  try {
+    singleFile = statSync(rootPath).isFile();
+  } catch {
+    singleFile = false;
+  }
   const files = discoverWorkflows(rootPath);
   const actions: ActionRef[] = [];
   for (const f of files) {
     actions.push(...parseWorkflowContent(readFileSync(f, "utf8"), f));
+  }
+  // P-058: a directory audit also audits the composite action
+  // definitions that live inside the scanned repo: every action file
+  // under .github/actions, plus any local action directory a workflow
+  // (or a composite already being scanned) references with a local
+  // uses path. Their internal steps are inventoried and classified
+  // like workflow steps and drive the verdict the same way; each such
+  // ref is flagged composite so counts stay interpretable.
+  const composites: string[] = [];
+  let unscannedComposites: string[] = [];
+  if (!singleFile && files.length > 0) {
+    const repoRoot = repoRootFor(rootPath);
+    const workflowSet = new Set(files.map((f) => resolve(f)));
+    const queue: string[] = [];
+    collectActionFiles(join(repoRoot, ".github", "actions"), queue);
+    for (const a of actions) {
+      const cf = resolveLocalActionFile(repoRoot, a.uses);
+      if (cf) queue.push(cf);
+    }
+    const seen = new Set<string>();
+    while (queue.length > 0) {
+      const file = queue.shift()!;
+      const key = resolve(file);
+      if (seen.has(key) || workflowSet.has(key)) continue;
+      if (!existsSync(file)) continue;
+      seen.add(key);
+      composites.push(file);
+      const refs = parseWorkflowContent(readFileSync(file, "utf8"), file);
+      for (const r of refs) {
+        r.composite = true;
+        actions.push(r);
+        const cf = resolveLocalActionFile(repoRoot, r.uses);
+        if (cf) queue.push(cf);
+      }
+    }
+    // P-046: name the remainder. Action files anywhere else in the
+    // repo that no workflow references are not scanned, and the report
+    // says which ones they are instead of implying full coverage.
+    const allActionFiles: string[] = [];
+    collectActionFiles(repoRoot, allActionFiles);
+    unscannedComposites = allActionFiles.filter((p) => !seen.has(resolve(p)) && !workflowSet.has(resolve(p)));
   }
   const counts = {
     total: actions.length,
@@ -269,8 +401,10 @@ export function auditWorkflows(rootPath: string): AuditReport {
     actions,
     counts,
     workflows: files,
+    composites,
     checkedAt: new Date().toISOString(),
   };
+  if (unscannedComposites.length > 0) report.unscannedComposites = unscannedComposites;
   if (files.length === 0) {
     // P-014: PINNED over zero workflows is vacuously true and was read as
     // an all-clear on real repos with no workflows directory at all
@@ -415,6 +549,7 @@ export async function buildPinPlan(rootPath: string, fetchFn: FetchFn): Promise<
     path: rootPath,
     entries,
     changes: entries.filter((e) => e.status === "pinned" && e.newLine && e.newLine !== e.originalLine).length,
+    alreadyPinned: entries.filter((e) => e.status === "already-pinned").length,
     checkedAt: new Date().toISOString(),
   };
   if (report.note) plan.note = report.note;
@@ -463,8 +598,13 @@ export function renderReport(report: AuditReport): string {
   lines.push(`actionpin audit ${report.path}: ${report.verdict}`);
   if (report.note) lines.push(`  NOTE: ${report.note}`);
   lines.push(`  workflows: ${report.workflows.length}, actions: ${report.counts.total}, pinned: ${report.counts.pinned}, mutable: ${report.counts.mutable}, branch: ${report.counts.branch}, local: ${report.counts.local}`);
+  if (report.composites) lines.push(`  composites: ${report.composites.length} composite file(s) scanned`);
+  if (report.unscannedComposites && report.unscannedComposites.length > 0) {
+    lines.push(`  NOTE: ${report.unscannedComposites.length} composite action file(s) not scanned (outside .github/actions and not referenced by a workflow): ${report.unscannedComposites.join(", ")}`);
+  }
   for (const a of report.actions) {
-    lines.push(`  [${a.classification}] ${a.workflow}:${a.line} ${a.uses} (${a.ownerType})`);
+    lines.push(`  [${a.classification}] ${a.workflow}:${a.line} ${a.uses} (${a.ownerType})${a.composite ? " [composite action]" : ""}`);
+    if (a.note) lines.push(`    NOTE: ${a.note}`);
   }
   if (report.note) lines.push("No workflows were audited, so no pinning conclusion applies to this path.");
   else if (report.verdict === "PINNED") lines.push("PINNED: every non-local action is pinned to a full commit SHA.");
@@ -475,7 +615,10 @@ export function renderReport(report: AuditReport): string {
 
 export function renderPlan(plan: PinPlan, applied: boolean): string {
   const lines: string[] = [];
-  lines.push(`actionpin ${applied ? "fix" : "pin plan"} ${plan.path}: ${plan.changes} change(s)`);
+  // P-059: the header states both numbers the body lists, so a reader
+  // comparing header to body never has to guess what was counted.
+  const alreadyPinned = plan.entries.filter((e) => e.status === "already-pinned").length;
+  lines.push(`actionpin ${applied ? "fix" : "pin plan"} ${plan.path}: ${plan.changes} to pin, ${alreadyPinned} already pinned`);
   if (plan.note) lines.push(`  NOTE: ${plan.note}`);
   for (const e of plan.entries) {
     if (e.status === "pinned") lines.push(`  [PIN] ${e.workflow}:${e.line} ${e.action}@${e.oldRef} -> ${e.sha} # ${e.oldRef}`);
