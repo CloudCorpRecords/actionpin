@@ -140,9 +140,13 @@ describe("auditWorkflows", () => {
     writeWorkflow("ci.yml", `      - uses: actions/checkout@${SHA_B}\n`);
     assert.equal(auditWorkflows(dir).verdict, "PINNED");
   });
-  it("handles a missing workflows directory without throwing", () => {
-    const r = auditWorkflows(join(dir, "does-not-exist"));
-    assert.equal(r.actions.length, 0); assert.equal(r.verdict, "PINNED"); assert.equal(r.workflows.length, 0);
+  it("throws on a missing target path (P-078 supersedes the old lenient shape)", () => {
+    // This test previously asserted that a nonexistent path returned
+    // PINNED over zero actions without throwing. That leniency is
+    // P-078: CI wired to a mistyped path went green on nothing. A
+    // nonexistent target is now a usage error; the CLI maps the throw
+    // to exit 2. The full behavior is pinned in test/chaos.test.ts.
+    assert.throws(() => auditWorkflows(join(dir, "does-not-exist")), /does not exist/i);
   });
   it("handles an existing repo with no workflows directory", () => {
     const r = auditWorkflows(dir);

@@ -8,7 +8,7 @@
  * branch to a commit SHA) goes through an injectable FetchFn; unit tests
  * use fixtures and never touch the network.
  */
-import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import type {
   ActionRef,
@@ -22,7 +22,7 @@ import type {
   Verdict,
 } from "./types.js";
 
-export const VERSION = "0.1.5";
+export const VERSION = "0.1.6";
 
 const SHA_RE = /^[0-9a-f]{40}$/i;
 const VERSION_RE = /^v?\d+(\.\d+){0,2}([-.+][0-9A-Za-z.-]+)?$/i;
@@ -253,25 +253,61 @@ export function computeVerdict(actions: ActionRef[]): Verdict {
   return hasPartial ? "PARTIAL" : "PINNED";
 }
 
-export function discoverWorkflows(rootPath: string): string[] {
+/**
+ * True only when p exists and is a regular file. Every path actionpin
+ * opens goes through a stat-type check first (P-077): opening a FIFO
+ * blocks until a writer appears, so a name with a workflow extension
+ * is never enough on its own, the way injectcheck stats before opening.
+ */
+function isRegularFile(p: string): boolean {
   try {
-    const st = statSync(rootPath);
-    if (st.isFile()) return [rootPath];
+    return statSync(p).isFile();
+  } catch {
+    return false;
+  }
+}
+
+export function discoverWorkflows(rootPath: string): string[] {
+  let rootStat;
+  try {
+    rootStat = statSync(rootPath);
   } catch {
     return [];
   }
+  if (rootStat.isFile()) {
+    // Single-file discovery is for workflow files only (P-078);
+    // auditWorkflows rejects other regular files as usage errors
+    // before discovery runs.
+    return /\.ya?ml$/i.test(rootPath) ? [rootPath] : [];
+  }
+  if (!rootStat.isDirectory()) return [];
   const candidates = [
     join(rootPath, ".github", "workflows"),
     ...(basename(rootPath) === "workflows" ? [rootPath] : []),
     ...(basename(rootPath) === ".github" ? [join(rootPath, "workflows")] : []),
   ];
   for (const dir of candidates) {
-    if (existsSync(dir) && statSync(dir).isDirectory()) {
-      return readdirSync(dir)
-        .filter((f) => /\.ya?ml$/i.test(f))
-        .sort()
-        .map((f) => join(dir, f));
+    let dirStat;
+    try {
+      dirStat = statSync(dir);
+    } catch {
+      continue;
     }
+    if (!dirStat.isDirectory()) continue;
+    let names: string[];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      return [];
+    }
+    // P-077: only regular files, by stat type, are returned for
+    // opening. A FIFO named pipe.yml and a directory named x.yml are
+    // both skipped here, before any open can block or fail.
+    return names
+      .filter((f) => /\.ya?ml$/i.test(f))
+      .filter((f) => isRegularFile(join(dir, f)))
+      .sort()
+      .map((f) => join(dir, f));
   }
   return [];
 }
@@ -295,7 +331,9 @@ function collectActionFiles(dir: string, out: string[], depth = 0): void {
       continue;
     }
     if (st.isDirectory()) collectActionFiles(p, out, depth + 1);
-    else if (/^action\.ya?ml$/i.test(name)) out.push(p);
+    // P-077: only a regular file can be an action definition; a FIFO,
+    // socket, or device named action.yml is skipped, never collected.
+    else if (st.isFile() && /^action\.ya?ml$/i.test(name)) out.push(p);
   }
 }
 
@@ -323,7 +361,7 @@ function resolveLocalActionFile(repoRoot: string, uses: string): string | null {
     if (st.isDirectory()) {
       for (const name of ["action.yml", "action.yaml"]) {
         const cand = join(abs, name);
-        if (existsSync(cand)) return cand;
+        if (isRegularFile(cand)) return cand;
       }
     }
   } catch {
@@ -333,15 +371,39 @@ function resolveLocalActionFile(repoRoot: string, uses: string): string | null {
 }
 
 export function auditWorkflows(rootPath: string): AuditReport {
-  let singleFile = false;
+  // P-078: a target that is not an auditable estate is a usage error,
+  // never a vacuous PINNED over zero actions. The CLI maps this throw
+  // to exit 2 with the message on stderr (the same contract as
+  // hookcheck and injectcheck on a nonexistent path), and the MCP
+  // tools surface it as an error instead of a success verdict.
+  let targetStat;
   try {
-    singleFile = statSync(rootPath).isFile();
+    targetStat = statSync(rootPath);
   } catch {
-    singleFile = false;
+    throw new Error(`Path does not exist: ${rootPath}`);
+  }
+  let singleFile = false;
+  if (targetStat.isFile()) {
+    // Single-file audit stays available for workflow and action files
+    // only (the README contract: passing an action.yml path directly
+    // parses it). Any other regular file was previously treated as a
+    // workflow itself and verdicted PINNED over zero actions with no
+    // note at all.
+    if (!/\.ya?ml$/i.test(rootPath)) {
+      throw new Error(`Not a workflow file: ${rootPath} (a single-file audit target must be a .yml or .yaml file)`);
+    }
+    singleFile = true;
+  } else if (!targetStat.isDirectory()) {
+    // A FIFO, socket, or device is not an auditable estate, and
+    // opening one can block forever (P-077).
+    throw new Error(`Path is neither a file nor a directory: ${rootPath}`);
   }
   const files = discoverWorkflows(rootPath);
   const actions: ActionRef[] = [];
   for (const f of files) {
+    // Defense in depth behind discovery (P-077): never open a path
+    // whose stat type is not a regular file.
+    if (!isRegularFile(f)) continue;
     actions.push(...parseWorkflowContent(readFileSync(f, "utf8"), f));
   }
   // P-058: a directory audit also audits the composite action
@@ -368,7 +430,7 @@ export function auditWorkflows(rootPath: string): AuditReport {
     const queue: string[] = [];
     for (const name of ["action.yml", "action.yaml"]) {
       const rootAction = join(repoRoot, name);
-      if (existsSync(rootAction)) queue.push(rootAction);
+      if (isRegularFile(rootAction)) queue.push(rootAction);
     }
     collectActionFiles(join(repoRoot, ".github", "actions"), queue);
     for (const a of actions) {
@@ -380,7 +442,9 @@ export function auditWorkflows(rootPath: string): AuditReport {
       const file = queue.shift()!;
       const key = resolve(file);
       if (seen.has(key) || workflowSet.has(key)) continue;
-      if (!existsSync(file)) continue;
+      // P-077: a queued composite path is opened only when it is a
+      // regular file; existence alone does not make a FIFO safe.
+      if (!isRegularFile(file)) continue;
       seen.add(key);
       composites.push(file);
       const refs = parseWorkflowContent(readFileSync(file, "utf8"), file);
