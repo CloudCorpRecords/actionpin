@@ -22,7 +22,7 @@ import type {
   Verdict,
 } from "./types.js";
 
-export const VERSION = "0.1.0";
+export const VERSION = "0.1.1";
 
 const SHA_RE = /^[0-9a-f]{40}$/i;
 const VERSION_RE = /^v?\d+(\.\d+){0,2}([-.+][0-9A-Za-z.-]+)?$/;
@@ -59,10 +59,14 @@ function cleanToken(raw: string): string {
 }
 
 export function parseUsesLine(rawLine: string): { uses: string; action: string; ref: string } | null {
-  const m = /^\s*-?\s*uses:\s*(.+?)\s*$/.exec(rawLine);
+  const m = /^\s*-?\s*uses\s*:\s*(.+?)\s*$/.exec(rawLine);
   if (!m) return null;
   const uses = cleanToken(m[1]);
   if (!uses) return null;
+  // A value that contains a GitHub expression is decided at workflow run
+  // time (matrix, inputs, vars). It cannot be classified statically, so it
+  // is skipped rather than reported as a fabricated action or ref.
+  if (uses.includes("${{")) return null;
   if (uses.startsWith("./") || uses.startsWith("../")) {
     return { uses, action: uses, ref: "" };
   }
@@ -191,10 +195,14 @@ export async function resolveRefToSha(
   repo: string,
   ref: string,
 ): Promise<string> {
+  // Encode each ref segment separately: the GitHub git-ref API takes the
+  // ref as a path, so a slash inside a tag or branch name (release/v1,
+  // feature/new-thing) must survive as a slash, not become %2F.
+  const encRef = ref.split("/").map(encodeURIComponent).join("/");
   const attempts: Array<{ url: string; kind: "tag" | "head" | "commit" }> = [
-    { url: `https://api.github.com/repos/${owner}/${repo}/git/ref/tags/${encodeURIComponent(ref)}`, kind: "tag" },
-    { url: `https://api.github.com/repos/${owner}/${repo}/git/ref/heads/${encodeURIComponent(ref)}`, kind: "head" },
-    { url: `https://api.github.com/repos/${owner}/${repo}/commits/${encodeURIComponent(ref)}`, kind: "commit" },
+    { url: `https://api.github.com/repos/${owner}/${repo}/git/ref/tags/${encRef}`, kind: "tag" },
+    { url: `https://api.github.com/repos/${owner}/${repo}/git/ref/heads/${encRef}`, kind: "head" },
+    { url: `https://api.github.com/repos/${owner}/${repo}/commits/${encRef}`, kind: "commit" },
   ];
   let lastStatus = 0;
   for (const attempt of attempts) {
@@ -235,6 +243,15 @@ export function actionRepo(action: string): { owner: string; repo: string } | nu
 /** Build the rewritten line for a pinned action, preserving indentation and content. */
 export function buildPinnedLine(rawLine: string, actionRef: ActionRef, sha: string): string {
   const needle = `${actionRef.action}@${actionRef.ref}`;
+  // A quoted uses value must keep its closing quote before the version
+  // comment, or the comment becomes part of the quoted string and corrupts
+  // the action reference.
+  for (const q of ['"', "'"]) {
+    const quoted = `${q}${needle}${q}`;
+    if (rawLine.includes(quoted)) {
+      return rawLine.replace(quoted, `${q}${actionRef.action}@${sha}${q} # ${actionRef.ref}`);
+    }
+  }
   const replacement = `${actionRef.action}@${sha} # ${actionRef.ref}`;
   if (rawLine.includes(needle)) return rawLine.replace(needle, replacement);
   // Fallback: replace the uses value token.
@@ -301,9 +318,17 @@ export async function applyPinPlan(rootPath: string, fetchFn: FetchFn): Promise<
     let changed = false;
     for (const e of entriesForFile) {
       const idx = e.line - 1;
-      if (idx >= 0 && idx < lines.length && e.newLine && lines[idx] !== e.newLine) {
-        lines[idx] = e.newLine;
-        changed = true;
+      if (idx >= 0 && idx < lines.length && e.newLine) {
+        // The file was split on \n, so a CRLF file keeps a trailing \r on
+        // each untouched line. The planned new line was built from a
+        // \r-stripped raw line, so restore the \r or the rewritten line
+        // would silently switch the file to mixed line endings.
+        let newLine = e.newLine;
+        if (lines[idx].endsWith("\r") && !newLine.endsWith("\r")) newLine += "\r";
+        if (lines[idx] !== newLine) {
+          lines[idx] = newLine;
+          changed = true;
+        }
       }
     }
     if (changed) {

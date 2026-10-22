@@ -90,6 +90,17 @@ docker run -i ghcr.io/cloudcorprecords/actionpin mcp
 docker run --rm -v "$PWD:/work" -w /work ghcr.io/cloudcorprecords/actionpin audit .
 ```
 
+## Limits (pinned by the hardening battery)
+
+These behaviors are deliberate, tested, and stated plainly so a green report is never misread:
+
+- **Scope is workflow files.** A directory audit scans `.github/workflows/*.yml` and `*.yaml` only. Composite action files (`action.yml`, `action.yaml`) are not scanned during a directory audit; pass an `action.yml` file path directly and it is parsed like any other file. Job-level `uses:` lines (reusable workflow calls) are in scope and are audited and pinned like step-level ones.
+- **Dynamic values are skipped, not guessed.** A `uses:` value that contains a GitHub expression (`${{ matrix.action }}`, `actions/checkout@${{ inputs.ref }}`) is decided at run time and cannot be classified statically. actionpin skips it entirely instead of inventing an action or a verdict for it. Audit the matrix or input values themselves if a workflow builds its actions dynamically.
+- **Short SHAs never count as pinned.** Only a full 40-character SHA (or a sha256 digest for `docker://` images) is `PINNED`. A short SHA such as `abc1234` is reported in the `BRANCH` bucket and fails the verdict, because a short prefix is not a stable pin.
+- **Refs containing slashes** (`release/v1`, `feature/new-thing`) are reported as `BRANCH` bucket moving refs. Fix mode resolves them through the git-ref API with the slash preserved.
+- **Line-wise parsing.** Flow-style YAML on one line (for example `steps: [{ uses: actions/checkout@v4 }]`) is not detected, and commented-out `uses:` lines are ignored.
+- **Docker refs are reported, never rewritten.** Pin container images by digest yourself; fix mode leaves `docker://` lines unchanged and says so in the plan.
+
 ## The toolkit
 
 actionpin is part of a family of small, single-purpose developer tools by the same author, all built the same way: one bin that serves a CLI and an MCP server, deterministic checks with evidence, no invented answers.
