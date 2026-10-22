@@ -100,6 +100,8 @@ These behaviors are deliberate, tested, and stated plainly so a green report is 
 - **Refs containing slashes** (`release/v1`, `feature/new-thing`) are reported as `BRANCH` bucket moving refs. Fix mode resolves them through the git-ref API with the slash preserved.
 - **Line-wise parsing.** Flow-style YAML on one line (for example `steps: [{ uses: actions/checkout@v4 }]`) is not detected, and commented-out `uses:` lines are ignored.
 - **Docker refs are reported, never rewritten.** Pin container images by digest yourself; fix mode leaves `docker://` lines unchanged and says so in the plan.
+- **Empty estates say so.** When no workflows are found under the audited path, the report carries a plain note that nothing was audited. The verdict is computed over zero actions and is not an all-clear for that path.
+- **Piped output is delivered whole, or the run fails.** Reports are written through a flush-aware emit path, so a report of any size arrives complete through a pipe, the way agents, scripts, and CI consume it. If the reader closes the pipe before the report is delivered, actionpin exits 141 (the shell-visible equivalent of SIGPIPE) instead of reporting success for output nobody received. Fixed in 0.1.2 after Round 1 real-repo validation caught silent truncation at exactly 65,536 bytes with a success exit code.
 
 ## The toolkit
 

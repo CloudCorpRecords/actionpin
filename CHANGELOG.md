@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.2 (2026-10-21)
+
+Fix release from Round 1 real-repo validation. No new features.
+
+- P-001 (REAL): piped output no longer truncates. The CLI called process.exit() immediately after printing, which cut stdout at exactly 65,536 bytes whenever a report was read through a pipe and still exited 0, handing agents and CI a corrupt JSON prefix with a success code. Six of the ten Round 1 corpus repos produced reports over that limit (the largest was about 696 KB). Every report now goes through an emit path that resolves only after stdout has flushed, and the exit code is applied with process.exitCode so the process ends naturally after delivery. If the reader closes the pipe early, the process exits 141 (128 + SIGPIPE) rather than reporting success for undelivered output. Regression tests pipe reports over 200 KiB through a real child process and parse them.
+- P-014 (COSMETIC): an audit that finds no workflows now says so plainly. The report and plan carry a note stating that nothing was audited and the verdict covers an empty estate, instead of a bare PINNED with total 0 that read as an all-clear (the kubernetes/kubernetes case in Round 1).
+
 ## 0.1.1 (2026-10-21)
 
 Hardening release. An adversarial battery of 31 cases (64 tests total, all passing) found and fixed five real bugs. No new features.

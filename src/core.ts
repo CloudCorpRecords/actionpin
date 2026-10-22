@@ -22,7 +22,7 @@ import type {
   Verdict,
 } from "./types.js";
 
-export const VERSION = "0.1.1";
+export const VERSION = "0.1.2";
 
 const SHA_RE = /^[0-9a-f]{40}$/i;
 const VERSION_RE = /^v?\d+(\.\d+){0,2}([-.+][0-9A-Za-z.-]+)?$/;
@@ -164,7 +164,7 @@ export function auditWorkflows(rootPath: string): AuditReport {
     thirdParty: actions.filter((a) => a.ownerType === "third-party").length,
     docker: actions.filter((a) => a.ownerType === "docker").length,
   };
-  return {
+  const report: AuditReport = {
     path: rootPath,
     verdict: computeVerdict(actions),
     actions,
@@ -172,6 +172,17 @@ export function auditWorkflows(rootPath: string): AuditReport {
     workflows: files,
     checkedAt: new Date().toISOString(),
   };
+  if (files.length === 0) {
+    // P-014: PINNED over zero workflows is vacuously true and was read as
+    // an all-clear on real repos with no workflows directory at all
+    // (kubernetes/kubernetes in Round 1 validation). Say so in the report
+    // itself, so every consumer sees the caveat next to the verdict.
+    report.note =
+      `No workflows found under ${rootPath}: there is no .github/workflows directory with .yml or .yaml files there, ` +
+      "so nothing was audited. The verdict above covers an empty estate and is not an all-clear; " +
+      "point actionpin at the repo root or at a workflows directory.";
+  }
+  return report;
 }
 
 function ghHeaders(): Record<string, string> {
@@ -294,12 +305,14 @@ export async function buildPinPlan(rootPath: string, fetchFn: FetchFn): Promise<
       entries.push({ workflow: a.workflow, line: a.line, action: a.action, oldRef: a.ref, originalLine: a.rawLine, status: "failed", error: err instanceof Error ? err.message : String(err) });
     }
   }
-  return {
+  const plan: PinPlan = {
     path: rootPath,
     entries,
     changes: entries.filter((e) => e.status === "pinned" && e.newLine && e.newLine !== e.originalLine).length,
     checkedAt: new Date().toISOString(),
   };
+  if (report.note) plan.note = report.note;
+  return plan;
 }
 
 export async function applyPinPlan(rootPath: string, fetchFn: FetchFn): Promise<FixResult> {
@@ -342,11 +355,13 @@ export async function applyPinPlan(rootPath: string, fetchFn: FetchFn): Promise<
 export function renderReport(report: AuditReport): string {
   const lines: string[] = [];
   lines.push(`actionpin audit ${report.path}: ${report.verdict}`);
+  if (report.note) lines.push(`  NOTE: ${report.note}`);
   lines.push(`  workflows: ${report.workflows.length}, actions: ${report.counts.total}, pinned: ${report.counts.pinned}, mutable: ${report.counts.mutable}, branch: ${report.counts.branch}, local: ${report.counts.local}`);
   for (const a of report.actions) {
     lines.push(`  [${a.classification}] ${a.workflow}:${a.line} ${a.uses} (${a.ownerType})`);
   }
-  if (report.verdict === "PINNED") lines.push("PINNED: every non-local action is pinned to a full commit SHA.");
+  if (report.note) lines.push("No workflows were audited, so no pinning conclusion applies to this path.");
+  else if (report.verdict === "PINNED") lines.push("PINNED: every non-local action is pinned to a full commit SHA.");
   else if (report.verdict === "EXPOSED") lines.push("EXPOSED: at least one third-party or container action uses a mutable tag or branch ref.");
   else lines.push("PARTIAL: some official actions use mutable or branch refs, no third-party exposure found.");
   return lines.join("\n");
@@ -355,6 +370,7 @@ export function renderReport(report: AuditReport): string {
 export function renderPlan(plan: PinPlan, applied: boolean): string {
   const lines: string[] = [];
   lines.push(`actionpin ${applied ? "fix" : "pin plan"} ${plan.path}: ${plan.changes} change(s)`);
+  if (plan.note) lines.push(`  NOTE: ${plan.note}`);
   for (const e of plan.entries) {
     if (e.status === "pinned") lines.push(`  [PIN] ${e.workflow}:${e.line} ${e.action}@${e.oldRef} -> ${e.sha} # ${e.oldRef}`);
     else if (e.status === "failed") lines.push(`  [FAIL] ${e.workflow}:${e.line} ${e.action}@${e.oldRef}: ${e.error ?? "resolution failed, line left unchanged"}`);

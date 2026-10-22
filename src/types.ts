@@ -30,6 +30,8 @@ export interface ActionRef {
 export interface AuditReport {
   path: string;
   verdict: Verdict;
+  /** Plain-language caveat when the estate is empty (P-014): a verdict on zero workflows is vacuous, not an all-clear. Absent when workflows were found. */
+  note?: string;
   actions: ActionRef[];
   counts: {
     total: number;
@@ -60,6 +62,8 @@ export interface PinPlanEntry {
 
 export interface PinPlan {
   path: string;
+  /** Same empty-estate caveat as AuditReport.note, propagated so a plan on zero workflows cannot read as a clean pass. */
+  note?: string;
   entries: PinPlanEntry[];
   /** Number of lines that would change (or did change in apply mode). */
   changes: number;
