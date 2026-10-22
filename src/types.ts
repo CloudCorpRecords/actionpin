@@ -25,6 +25,8 @@ export interface ActionRef {
   ownerType: OwnerType;
   /** The raw source line, preserved exactly. */
   rawLine: string;
+  /** True when this line is a YAML alias (*name) that reuses an anchored uses value or step defined earlier in the same file. The classification is inherited from the anchor definition; fix mode never rewrites an alias line directly. */
+  viaAlias?: boolean;
 }
 
 export interface AuditReport {

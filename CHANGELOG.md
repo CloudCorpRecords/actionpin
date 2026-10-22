@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.3 (2026-10-21)
+
+Fix release from the overnight flywheel Wave A evasion hunt. No new features. 93 tests (72 prior plus 21 new in test/wavea.test.ts), every new test failed against the published 0.1.2 binary first. Hunt report: ~/workspace/security-wave/overnight/waves/waveA-actionpin/HUNT.md.
+
+- Docker refs were classified PINNED on the shape of the string, not on validity: a truncated sha256 digest (sha256:abcd1234), a 64-character non-hex digest, and a mutable tag spelled as 40 hex characters (docker://myimage:<40 hex>) all counted as pinned, so a repo whose only container line carried an invalid digest verdicted PINNED with exit 0. A container image now counts as PINNED only with a full sha256 (64 hex) or sha512 (128 hex) content digest; every other docker ref is MUTABLE.
+- YAML anchors and aliases (supported by GitHub Actions since September 2025) were mishandled three ways. A value anchor (uses: &name owner/repo@ref) was reported as a fabricated action named after the anchor token, and an alias (uses: *name) as a fabricated action named after the alias, so an anchored pinned action and its alias reported MUTABLE third-party instead of PINNED official. Anchors and aliases now resolve within the file: alias lines inherit the anchored classification and are flagged viaAlias in the report.
+- A step anchor between the dash and the uses key (- &step uses: owner/repo@ref) made the line invisible: a workflow whose only step was written that way reported total 0 and PINNED. Step anchors in that position, anchors alone on the dash line, and step aliases (- *name) are now inventoried.
+- Fix mode never rewrites an alias line: the plan marks it failed with an explanation that it is pinned when its anchor definition line is pinned, and pinning the definition line alone brings an anchored workflow to PINNED.
+- Quoted uses values containing a space (a trailing space before the closing quote, or a comment inside the quotes) were cut at the space, leaving the action name with a stray leading quote and mislabeling official actions as third-party, which flipped PARTIAL verdicts to EXPOSED. The quoted scalar is now read to its closing quote.
+- Version tags with an uppercase V (V4, V1.2.3) were classified BRANCH instead of MUTABLE because the version pattern only accepted a lowercase v. The pattern is now case-insensitive.
+
 ## 0.1.2 (2026-10-21)
 
 Fix release from Round 1 real-repo validation. No new features.

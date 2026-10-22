@@ -16,7 +16,7 @@ For every `uses:` line in `.github/workflows/*.yml` and `*.yaml`:
 
 | classification | meaning |
 | --- | --- |
-| `PINNED` | Ref is a full 40-character commit SHA (or a sha256 digest for a container image) |
+| `PINNED` | Ref is a full 40-character commit SHA (or a full sha256 or sha512 content digest for a container image) |
 | `MUTABLE` | Ref is a version tag such as `v4` or `v4.2.1`. The tag can move. |
 | `BRANCH` | Ref is a branch such as `main`, `master`, or `HEAD`. It moves by design. |
 | `LOCAL` | A local path such as `./local/action`. Never rewritten. |
@@ -96,7 +96,9 @@ These behaviors are deliberate, tested, and stated plainly so a green report is 
 
 - **Scope is workflow files.** A directory audit scans `.github/workflows/*.yml` and `*.yaml` only. Composite action files (`action.yml`, `action.yaml`) are not scanned during a directory audit; pass an `action.yml` file path directly and it is parsed like any other file. Job-level `uses:` lines (reusable workflow calls) are in scope and are audited and pinned like step-level ones.
 - **Dynamic values are skipped, not guessed.** A `uses:` value that contains a GitHub expression (`${{ matrix.action }}`, `actions/checkout@${{ inputs.ref }}`) is decided at run time and cannot be classified statically. actionpin skips it entirely instead of inventing an action or a verdict for it. Audit the matrix or input values themselves if a workflow builds its actions dynamically.
-- **Short SHAs never count as pinned.** Only a full 40-character SHA (or a sha256 digest for `docker://` images) is `PINNED`. A short SHA such as `abc1234` is reported in the `BRANCH` bucket and fails the verdict, because a short prefix is not a stable pin.
+- **Short SHAs never count as pinned.** Only a full 40-character SHA (or a full sha256 or sha512 digest for `docker://` images) is `PINNED`. A short SHA such as `abc1234` is reported in the `BRANCH` bucket and fails the verdict, because a short prefix is not a stable pin.
+- **Container tags never count as pinned.** For `docker://` images only a full content digest counts. A tag spelled as 40 hex characters is still a tag and can be re-pushed, and a truncated or non-hex digest is not a digest; both are `MUTABLE`.
+- **YAML anchors and aliases are resolved within the file.** GitHub Actions has supported them since September 2025. An anchored `uses:` value is classified by the value itself, an alias line (`uses: *name`, or a step alias `- *name`) inherits the anchored classification and is flagged `viaAlias`, and anchors must be defined before use in the same file, matching GitHub. Fix mode pins the anchor definition line and never rewrites an alias line.
 - **Refs containing slashes** (`release/v1`, `feature/new-thing`) are reported as `BRANCH` bucket moving refs. Fix mode resolves them through the git-ref API with the slash preserved.
 - **Line-wise parsing.** Flow-style YAML on one line (for example `steps: [{ uses: actions/checkout@v4 }]`) is not detected, and commented-out `uses:` lines are ignored.
 - **Docker refs are reported, never rewritten.** Pin container images by digest yourself; fix mode leaves `docker://` lines unchanged and says so in the plan.

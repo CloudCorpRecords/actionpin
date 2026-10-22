@@ -22,10 +22,12 @@ import type {
   Verdict,
 } from "./types.js";
 
-export const VERSION = "0.1.2";
+export const VERSION = "0.1.3";
 
 const SHA_RE = /^[0-9a-f]{40}$/i;
-const VERSION_RE = /^v?\d+(\.\d+){0,2}([-.+][0-9A-Za-z.-]+)?$/;
+const VERSION_RE = /^v?\d+(\.\d+){0,2}([-.+][0-9A-Za-z.-]+)?$/i;
+/** A container image is pinned only by a full content digest, never by a tag. */
+const DOCKER_DIGEST_RE = /^(?:sha256:[0-9a-f]{64}|sha512:[0-9a-f]{128})$/i;
 const BRANCH_NAMES = new Set(["main", "master", "head", "develop", "dev", "trunk", "release"]);
 
 export function classifyRef(ref: string): Classification {
@@ -49,6 +51,19 @@ export function ownerTypeFor(action: string, uses: string): OwnerType {
 /** Strip surrounding quotes and a trailing YAML comment from a uses value token. */
 function cleanToken(raw: string): string {
   let v = raw.trim();
+  const q = v[0];
+  if (q === '"' || q === "'") {
+    const end = v.indexOf(q, 1);
+    if (end > 0) {
+      // Take the quoted scalar itself rather than the first whitespace
+      // token: a space before the closing quote, or a comment written
+      // inside the quotes, used to cut the value at the space and leave
+      // the action carrying a stray leading quote and a wrong owner.
+      // A uses value never contains a space-hash segment, so a trailing
+      // one inside the quotes is author commentary, not part of the ref.
+      return v.slice(1, end).split(/\s+#/)[0].trim();
+    }
+  }
   // A trailing comment starts with a space-hash outside quotes; the uses
   // value itself never contains a space, so take the first token.
   v = v.split(/\s+/)[0] ?? "";
@@ -58,59 +73,143 @@ function cleanToken(raw: string): string {
   return v;
 }
 
-export function parseUsesLine(rawLine: string): { uses: string; action: string; ref: string } | null {
-  const m = /^\s*-?\s*uses\s*:\s*(.+?)\s*$/.exec(rawLine);
-  if (!m) return null;
-  const uses = cleanToken(m[1]);
-  if (!uses) return null;
-  // A value that contains a GitHub expression is decided at workflow run
-  // time (matrix, inputs, vars). It cannot be classified statically, so it
-  // is skipped rather than reported as a fabricated action or ref.
-  if (uses.includes("${{")) return null;
+/** Split a cleaned uses value into action and ref. */
+function splitUses(uses: string): { action: string; ref: string } {
   if (uses.startsWith("./") || uses.startsWith("../")) {
-    return { uses, action: uses, ref: "" };
+    return { action: uses, ref: "" };
   }
   if (uses.startsWith("docker://")) {
     // docker://image:tag or docker://image@sha256:digest
     const rest = uses.slice("docker://".length);
     const at = rest.lastIndexOf("@");
-    if (at > 0) return { uses, action: `docker://${rest.slice(0, at)}`, ref: rest.slice(at + 1) };
+    if (at > 0) return { action: `docker://${rest.slice(0, at)}`, ref: rest.slice(at + 1) };
     const colon = rest.lastIndexOf(":");
     if (colon > 0 && !rest.slice(colon + 1).includes("/")) {
-      return { uses, action: `docker://${rest.slice(0, colon)}`, ref: rest.slice(colon + 1) };
+      return { action: `docker://${rest.slice(0, colon)}`, ref: rest.slice(colon + 1) };
     }
-    return { uses, action: uses, ref: "" };
+    return { action: uses, ref: "" };
   }
   const at = uses.lastIndexOf("@");
-  if (at <= 0) return { uses, action: uses, ref: "" };
-  return { uses, action: uses.slice(0, at), ref: uses.slice(at + 1) };
+  if (at <= 0) return { action: uses, ref: "" };
+  return { action: uses.slice(0, at), ref: uses.slice(at + 1) };
+}
+
+export interface ParsedUses {
+  uses: string;
+  action: string;
+  ref: string;
+  /** Anchor name when the uses value itself carries one: uses: &name owner/repo@ref. */
+  anchor?: string;
+  /** Alias name when the uses value is an alias: uses: *name. Action and ref are empty until the alias is resolved against its anchor. */
+  alias?: string;
+  /** Anchor name when an anchor sits between the step dash and the uses key: - &name uses: owner/repo@ref. */
+  stepAnchor?: string;
+}
+
+export function parseUsesLine(rawLine: string): ParsedUses | null {
+  // A step anchor can sit between the dash and the key (- &step uses: ...)
+  // and was previously enough to make the whole line invisible.
+  const m = /^\s*(?:-\s*)?(?:&(\S+)\s+)?uses\s*:\s*(.+?)\s*$/.exec(rawLine);
+  if (!m) return null;
+  let rawValue = m[2].trim();
+  // A value anchor (uses: &name owner/repo@ref) names the scalar that
+  // follows it; the anchor token is not the action.
+  let anchor: string | undefined;
+  const am = /^&(\S+)\s+(.+)$/.exec(rawValue);
+  if (am) {
+    anchor = am[1];
+    rawValue = am[2];
+  }
+  const uses = cleanToken(rawValue);
+  if (!uses) return null;
+  // A value that contains a GitHub expression is decided at workflow run
+  // time (matrix, inputs, vars). It cannot be classified statically, so it
+  // is skipped rather than reported as a fabricated action or ref.
+  if (uses.includes("${{")) return null;
+  if (uses.startsWith("*")) {
+    // An alias reuses an anchored value defined earlier in the same file;
+    // parseWorkflowContent resolves it. Reported on its own it would be a
+    // fabricated action named after the alias token.
+    return { uses, action: "", ref: "", anchor, alias: uses.slice(1), stepAnchor: m[1] };
+  }
+  const { action, ref } = splitUses(uses);
+  return { uses, action, ref, anchor, stepAnchor: m[1] };
+}
+
+function buildActionRef(uses: string, workflow: string, line: number, rawLine: string, viaAlias: boolean): ActionRef {
+  const { action, ref } = splitUses(uses);
+  const ownerType = ownerTypeFor(action, uses);
+  let classification: Classification;
+  if (ownerType === "local") classification = "LOCAL";
+  else if (ownerType === "docker") {
+    // A container image is pinned only by a full sha256 or sha512 content
+    // digest. Anything else is a tag, including a tag spelled as 40 hex
+    // characters and a digest that is truncated or not hex at all; tags
+    // can be re-pushed, so they never count as pinned.
+    classification = DOCKER_DIGEST_RE.test(ref) ? "PINNED" : "MUTABLE";
+  } else if (!ref) classification = "MUTABLE";
+  else classification = classifyRef(ref);
+  const out: ActionRef = { workflow, line, uses, action, ref, classification, ownerType, rawLine };
+  if (viaAlias) out.viaAlias = true;
+  return out;
 }
 
 export function parseWorkflowContent(content: string, workflow: string): ActionRef[] {
   const out: ActionRef[] = [];
   const lines = content.split(/\r?\n/);
+  // YAML anchors and aliases (supported by GitHub Actions since September
+  // 2025) are file-local and defined before use. Track both scalar anchors
+  // on uses values and anchors on whole steps so an alias line resolves to
+  // the anchored action instead of being reported as a fabricated one.
+  const scalarAnchors = new Map<string, string>();
+  const stepAnchors = new Map<string, string>();
+  let pendingStepAnchor: string | undefined;
   for (let i = 0; i < lines.length; i++) {
-    const parsed = parseUsesLine(lines[i]);
-    if (!parsed) continue;
-    const ownerType = ownerTypeFor(parsed.action, parsed.uses);
-    let classification: Classification;
-    if (ownerType === "local") classification = "LOCAL";
-    else if (ownerType === "docker") {
-      // A docker image pinned by sha256 digest counts as pinned; a tag does not.
-      classification = parsed.ref.startsWith("sha256:") || SHA_RE.test(parsed.ref) ? "PINNED" : parsed.ref ? classifyRef(parsed.ref) === "PINNED" ? "PINNED" : "MUTABLE" : "MUTABLE";
-      if (parsed.ref && /^sha256:[0-9a-f]{64}$/i.test(parsed.ref)) classification = "PINNED";
-    } else if (!parsed.ref) classification = "MUTABLE";
-    else classification = classifyRef(parsed.ref);
-    out.push({
-      workflow,
-      line: i + 1,
-      uses: parsed.uses,
-      action: parsed.action,
-      ref: parsed.ref,
-      classification,
-      ownerType,
-      rawLine: lines[i],
-    });
+    const line = lines[i];
+    // A step alias (- *name on its own line) reuses an anchored step.
+    const stepAlias = /^\s*-\s*\*(\S+)\s*$/.exec(line);
+    if (stepAlias) {
+      const target = stepAnchors.get(stepAlias[1]);
+      if (target) out.push(buildActionRef(target, workflow, i + 1, line, true));
+      pendingStepAnchor = undefined;
+      continue;
+    }
+    // A step anchor alone on the dash line (- &name) names the step whose
+    // uses key follows on a later line of the same step.
+    const stepAnchorOnly = /^\s*-\s*&(\S+)\s*$/.exec(line);
+    if (stepAnchorOnly) {
+      pendingStepAnchor = stepAnchorOnly[1];
+      continue;
+    }
+    const isStepStart = /^\s*-\s/.test(line);
+    const parsed = parseUsesLine(line);
+    if (!parsed) {
+      // A new step dash ends the previous step, so a pending step anchor
+      // that never reached a uses line is dead.
+      if (isStepStart) pendingStepAnchor = undefined;
+      continue;
+    }
+    // Resolve an alias value to its anchored uses string. An alias whose
+    // anchor is not defined earlier in this file is invalid YAML for
+    // GitHub and is skipped rather than fabricated.
+    let effectiveUses = parsed.uses;
+    let viaAlias = false;
+    if (parsed.alias) {
+      const target = scalarAnchors.get(parsed.alias);
+      if (!target) {
+        pendingStepAnchor = undefined;
+        continue;
+      }
+      effectiveUses = target;
+      viaAlias = true;
+    }
+    if (parsed.anchor) scalarAnchors.set(parsed.anchor, effectiveUses);
+    if (parsed.stepAnchor) stepAnchors.set(parsed.stepAnchor, effectiveUses);
+    else if (pendingStepAnchor) {
+      stepAnchors.set(pendingStepAnchor, effectiveUses);
+      pendingStepAnchor = undefined;
+    }
+    out.push(buildActionRef(effectiveUses, workflow, i + 1, line, viaAlias));
   }
   return out;
 }
@@ -281,6 +380,13 @@ export async function buildPinPlan(rootPath: string, fetchFn: FetchFn): Promise<
     }
     if (a.classification === "PINNED") {
       entries.push({ workflow: a.workflow, line: a.line, action: a.action, oldRef: a.ref, originalLine: a.rawLine, status: "already-pinned" });
+      continue;
+    }
+    if (a.viaAlias) {
+      // An alias line carries no ref of its own: it is pinned when the
+      // anchor definition line is pinned, and rewriting the alias token
+      // would break the YAML, so the line is always left unchanged.
+      entries.push({ workflow: a.workflow, line: a.line, action: a.action, oldRef: a.ref, originalLine: a.rawLine, status: "failed", error: "Alias line: it reuses an anchored uses value and is pinned when its anchor definition line is pinned; alias lines are never rewritten directly" });
       continue;
     }
     if (a.ownerType === "docker") {
