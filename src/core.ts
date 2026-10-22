@@ -22,7 +22,7 @@ import type {
   Verdict,
 } from "./types.js";
 
-export const VERSION = "0.1.4";
+export const VERSION = "0.1.5";
 
 const SHA_RE = /^[0-9a-f]{40}$/i;
 const VERSION_RE = /^v?\d+(\.\d+){0,2}([-.+][0-9A-Za-z.-]+)?$/i;
@@ -351,12 +351,25 @@ export function auditWorkflows(rootPath: string): AuditReport {
   // uses path. Their internal steps are inventoried and classified
   // like workflow steps and drive the verdict the same way; each such
   // ref is flagged composite so counts stay interpretable.
+  // P-067: the root-level action.yml or action.yaml is the scanned
+  // repo's own action definition, the canonical location for a
+  // published GitHub Action, so a directory audit scans it on the
+  // same terms whether or not any workflow references it (the usual
+  // shape is a workflow consuming it by remote self ref at a pinned
+  // SHA, which the local-path machinery never follows). The seen set
+  // below dedupes it against every other discovery path, so a root
+  // action whose steps reference the repo's own action via ./ or via
+  // its published name is scanned exactly once and cannot recurse.
   const composites: string[] = [];
   let unscannedComposites: string[] = [];
-  if (!singleFile && files.length > 0) {
+  if (!singleFile) {
     const repoRoot = repoRootFor(rootPath);
     const workflowSet = new Set(files.map((f) => resolve(f)));
     const queue: string[] = [];
+    for (const name of ["action.yml", "action.yaml"]) {
+      const rootAction = join(repoRoot, name);
+      if (existsSync(rootAction)) queue.push(rootAction);
+    }
     collectActionFiles(join(repoRoot, ".github", "actions"), queue);
     for (const a of actions) {
       const cf = resolveLocalActionFile(repoRoot, a.uses);
@@ -405,7 +418,7 @@ export function auditWorkflows(rootPath: string): AuditReport {
     checkedAt: new Date().toISOString(),
   };
   if (unscannedComposites.length > 0) report.unscannedComposites = unscannedComposites;
-  if (files.length === 0) {
+  if (files.length === 0 && composites.length === 0) {
     // P-014: PINNED over zero workflows is vacuously true and was read as
     // an all-clear on real repos with no workflows directory at all
     // (kubernetes/kubernetes in Round 1 validation). Say so in the report

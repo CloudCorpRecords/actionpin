@@ -50,9 +50,9 @@ export interface AuditReport {
     docker: number;
   };
   workflows: string[];
-  /** Composite action definition files whose internal steps were audited in a directory scan (P-058): files under .github/actions plus any local action directory a workflow or a scanned composite references. Empty for a single-file audit. */
+  /** Composite action definition files whose internal steps were audited in a directory scan (P-058, P-067): the root-level action.yml or action.yaml (the scanned repo's own published action definition), files under .github/actions, plus any local action directory a workflow or a scanned composite references. Empty for a single-file audit. */
   composites?: string[];
-  /** Action definition files found in the repo that a directory scan did not audit because they sit outside .github/actions and no workflow or scanned composite references them (P-046). Named so a report never silently implies full composite coverage. */
+  /** Action definition files found in the repo that a directory scan did not audit because they are not the root action file, sit outside .github/actions, and no workflow or scanned composite references them (P-046). Named so a report never silently implies full composite coverage. */
   unscannedComposites?: string[];
   checkedAt: string;
 }

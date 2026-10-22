@@ -211,8 +211,11 @@ describe("waveB P-046: composite coverage is stated in the report", () => {
   });
   it("an unreferenced action file outside .github/actions is named as unscanned", () => {
     writeWorkflow("ci.yml", `    steps:\n      - uses: actions/checkout@${SHA_B}\n`);
-    writeAction("action.yml", [
-      "name: rootact",
+    // Since P-067 the root-level action.yml is the scanned repo's own
+    // action definition and is always scanned, so the unscanned
+    // remainder is an unreferenced action file elsewhere in the tree.
+    writeAction(join("tools", "orphan", "action.yml"), [
+      "name: orphanact",
       "runs:",
       "  using: composite",
       "  steps:",

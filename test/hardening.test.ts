@@ -88,12 +88,13 @@ describe("hardening: YAML shapes", () => {
     assert.equal(p?.action, "actions/checkout");
     assert.equal(p?.ref, "v4");
   });
-  it("does not scan a composite action.yml at a repo root during a directory audit (documented scope)", () => {
+  it("scans a composite action.yml at a repo root during a directory audit (P-067 supersedes the old documented scope limit)", () => {
     writeFileSync(join(dir, "action.yml"), "runs:\n  using: composite\n  steps:\n    - uses: actions/checkout@v4\n", "utf8");
     writeWorkflow("ci.yml", "      - uses: actions/checkout@v4\n");
     const r = auditWorkflows(dir);
-    assert.equal(r.counts.total, 1);
+    assert.equal(r.counts.total, 2);
     assert.equal(r.workflows.length, 1);
+    assert.equal(r.composites?.length, 1);
   });
   it("parses a composite action.yml correctly when the file is passed directly", () => {
     const p = join(dir, "action.yml");
