@@ -54,6 +54,8 @@ export interface AuditReport {
   composites?: string[];
   /** Action definition files found in the repo that a directory scan did not audit because they are not the root action file, sit outside .github/actions, and no workflow or scanned composite references them (P-046). Named so a report never silently implies full composite coverage. */
   unscannedComposites?: string[];
+  /** Workflow or composite files that contain a uses key whose value could not be extracted (P-174): the file is named, the report carries a note, and the verdict is floored at PARTIAL, so an unparsed file never silently contributes zero actions to a PINNED verdict. Absent when every file parsed. */
+  unparsedWorkflows?: string[];
   checkedAt: string;
 }
 

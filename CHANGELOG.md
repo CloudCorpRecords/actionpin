@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.7 (2026-10-23)
+
+Fix release from Round 5 validation (Swarm C, C-5). 157 tests (138 prior plus 19 new in test/round5.test.ts), every new test failed against the published 0.1.6 code first except the two kept-behavior guards (a uses word inside a quoted run value, and a dynamic flow uses), which passed before and after.
+
+- P-174 (BLOCKER): flow-style workflow uses entries were invisible. An audit of a workflow written in YAML flow style (jobs, steps, and uses all in flow mappings and sequences on shared lines) listed the file, inventoried zero actions, and verdicted PINNED, while the step used actions/checkout@v4 (mutable). Flow style is valid, GitHub-accepted YAML, and the README even listed it as a known limit; the limit is removed. A quote-aware flow scanner now inventories uses entries in flow mappings and sequences: several entries sharing one line, a flow step on a dash line, flow collections split across lines (tracked by flow depth), unquoted, single-quoted, and double-quoted values, quoted JSON-shaped keys, flow job-level reusable workflow calls, and flow anchors and aliases, all classified exactly like block-style entries. The repro repo now verdicts PARTIAL with the checkout@v4 ref classified MUTABLE. A uses word inside a quoted string, a run command, or a comment still invents no action, and block-style behavior is unchanged: cli/cli sparse .github at ed84a97a audits byte-identical on 0.1.6 and 0.1.7 (PINNED, 229 actions, all pinned).
+- P-174 (verdict honesty): a workflow or composite file that carries a uses key whose value cannot be extracted no longer silently contributes zero actions to a PINNED verdict. The report names such files in a new unparsedWorkflows field, carries a note saying the file could not be fully parsed, and floors the verdict at PARTIAL; the pin plan inherits the note.
+- P-174 (fix mode): pinning a flow entry no longer corrupts the line. The version comment is omitted on a flow line, where it would comment out the rest of the line, and when several flow entries share one line the plan chains the rewrite so applying it pins every entry on that line instead of overwriting one pin with the next.
+
 ## 0.1.6 (2026-10-22)
 
 Fix release from the overnight flywheel chaos hunt (Swarm 4, hostile filesystem targets). 138 tests (122 prior plus 16 new in test/chaos.test.ts), every new test failed or hung against the published 0.1.5 code first, except the three kept-behavior locks (single .yml and .yaml file audits, and the P-014 empty-estate note), which passed before and after. One existing test was updated in place: the core test that asserted a nonexistent path returns PINNED without throwing now asserts the throw, because that leniency was P-078 itself.

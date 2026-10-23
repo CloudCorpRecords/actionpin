@@ -4,9 +4,11 @@
  *
  * Parsing is deliberately line-wise with no YAML library. Fix mode must
  * preserve the author's formatting exactly, so the file is never parsed
- * into a document and re-emitted. All network access (resolving a tag or
- * branch to a commit SHA) goes through an injectable FetchFn; unit tests
- * use fixtures and never touch the network.
+ * into a document and re-emitted. A quote-aware flow scanner covers
+ * YAML flow style on top of the block parser (P-174). All network
+ * access (resolving a tag or branch to a commit SHA) goes through an
+ * injectable FetchFn; unit tests use fixtures and never touch the
+ * network.
  */
 import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
@@ -22,7 +24,7 @@ import type {
   Verdict,
 } from "./types.js";
 
-export const VERSION = "0.1.6";
+export const VERSION = "0.1.7";
 
 const SHA_RE = /^[0-9a-f]{40}$/i;
 const VERSION_RE = /^v?\d+(\.\d+){0,2}([-.+][0-9A-Za-z.-]+)?$/i;
@@ -183,8 +185,181 @@ function buildActionRef(uses: string, workflow: string, line: number, rawLine: s
   return out;
 }
 
-export function parseWorkflowContent(content: string, workflow: string): ActionRef[] {
+/**
+ * P-174: one uses occurrence found by the flow scanner. The scanner
+ * walks a line outside quotes and comments and records every uses key
+ * that sits in a key position (after a flow opener, a flow comma, or
+ * at the start of a line that continues a flow collection opened on an
+ * earlier line). A uses word inside a quoted string, a run command, or
+ * a comment is not an occurrence.
+ */
+interface UsesOccurrence {
+  /** Index of the uses key on its line, used to dedupe the block parser's entry. */
+  start: number;
+  /** The value token as written, quotes included when quoted; empty when the key carries no value. */
+  valueToken: string;
+  /** Anchor name when the value carries one: uses: &name owner/repo@ref. */
+  anchor?: string;
+  /** Anchor name when an anchor sits immediately before the uses key. */
+  stepAnchor?: string;
+}
+
+/** Read a quoted scalar starting at line[start]; returns the token (quotes included) and the index just past it. */
+function readQuotedToken(line: string, start: number): { token: string; end: number } {
+  const q = line[start];
+  let i = start + 1;
+  while (i < line.length) {
+    const c = line[i];
+    if (q === '"' && c === "\\") { i += 2; continue; }
+    if (c === q) {
+      if (q === "'" && line[i + 1] === "'") { i += 2; continue; }
+      return { token: line.slice(start, i + 1), end: i + 1 };
+    }
+    i++;
+  }
+  return { token: line.slice(start), end: line.length };
+}
+
+function scanUsesOccurrences(line: string, flowDepthAtStart: number): UsesOccurrence[] {
+  const occs: UsesOccurrence[] = [];
+  let inSingle = false;
+  let inDouble = false;
+  let seenFlowOpen = false;
+  let i = 0;
+  const isBoundaryBefore = (pos: number): boolean => {
+    // A uses key is a candidate when the last non-space character
+    // before it opens a flow entry or separates flow entries, or when
+    // the key starts a line that continues a flow collection.
+    let j = pos - 1;
+    while (j >= 0 && (line[j] === " " || line[j] === "\t")) j--;
+    if (j < 0) return true;
+    const prev = line[j];
+    if (prev === "{" || prev === "[") return true;
+    if (prev === ",") return seenFlowOpen || flowDepthAtStart > 0;
+    if (prev === "-") return line.slice(0, j).trim() === "" || seenFlowOpen || flowDepthAtStart > 0;
+    return false;
+  };
+  while (i < line.length) {
+    const c = line[i];
+    if (inSingle) {
+      if (c === "'" && line[i + 1] === "'") { i += 2; continue; }
+      if (c === "'") inSingle = false;
+      i++;
+      continue;
+    }
+    if (inDouble) {
+      if (c === "\\") { i += 2; continue; }
+      if (c === '"') inDouble = false;
+      i++;
+      continue;
+    }
+    if (c === "#" && (i === 0 || /[\s{[,;]/.test(line[i - 1]))) break;
+    if (c === "{" || c === "[") { seenFlowOpen = true; i++; continue; }
+    // A quoted key ("uses": or 'uses':), the JSON-shaped flow form.
+    if ((c === '"' || c === "'") && isBoundaryBefore(i)) {
+      const km = /^["']uses["']\s*:\s*/.exec(line.slice(i));
+      if (km) {
+        const keyStart = i;
+        i += km[0].length;
+        i = pushFlowValue(line, i, occs, line.slice(0, keyStart), keyStart);
+        continue;
+      }
+    }
+    if (c === "'") { inSingle = true; i++; continue; }
+    if (c === '"') { inDouble = true; i++; continue; }
+    if (c === "u" && isBoundaryBefore(i)) {
+      const km = /^uses\s*:\s*/.exec(line.slice(i));
+      if (km) {
+        const keyStart = i;
+        i += km[0].length;
+        i = pushFlowValue(line, i, occs, line.slice(0, keyStart), keyStart);
+        continue;
+      }
+    }
+    i++;
+  }
+  return occs;
+}
+
+/** Parse the value after a flow uses colon at line[pos], record the occurrence, and return the index just past the value. */
+function pushFlowValue(line: string, pos: number, occs: UsesOccurrence[], prefix: string, start: number): number {
+  let i = pos;
+  let anchor: string | undefined;
+  const am = /^&(\S+)\s+/.exec(line.slice(i));
+  if (am) {
+    anchor = am[1];
+    i += am[0].length;
+  }
+  let valueToken = "";
+  if (i < line.length && (line[i] === '"' || line[i] === "'")) {
+    const r = readQuotedToken(line, i);
+    valueToken = r.token;
+    i = r.end;
+  } else {
+    let j = i;
+    while (j < line.length && !/[\s,\]}]/.test(line[j])) j++;
+    valueToken = line.slice(i, j);
+    i = j;
+  }
+  const stepAnchorM = /&([A-Za-z0-9_-]+)[\s{[,]*$/.exec(prefix);
+  occs.push({ start, valueToken, anchor, stepAnchor: stepAnchorM ? stepAnchorM[1] : undefined });
+  return i;
+}
+
+/** Net flow-collection depth change of one line, counted outside quotes and comments. */
+function flowDepthDelta(line: string): number {
+  let delta = 0;
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (inSingle) {
+      if (c === "'" && line[i + 1] === "'") { i++; continue; }
+      if (c === "'") inSingle = false;
+      continue;
+    }
+    if (inDouble) {
+      if (c === "\\") { i++; continue; }
+      if (c === '"') inDouble = false;
+      continue;
+    }
+    if (c === "#" && (i === 0 || /[\s{[,;]/.test(line[i - 1]))) break;
+    if (c === "'") { inSingle = true; continue; }
+    if (c === '"') { inDouble = true; continue; }
+    if (c === "{" || c === "[") delta++;
+    else if (c === "}" || c === "]") delta--;
+  }
+  return delta;
+}
+
+type FlowValueParse =
+  | { kind: "ok"; parsed: ParsedUses }
+  | { kind: "dynamic" }
+  | { kind: "empty" };
+
+/** Build a ParsedUses from a flow value token, mirroring parseUsesLine's value handling. */
+function parseFlowValue(occ: UsesOccurrence): FlowValueParse {
+  const rawValue = occ.valueToken.trim();
+  if (!rawValue) return { kind: "empty" };
+  const uses = cleanToken(rawValue);
+  if (!uses) return { kind: "empty" };
+  if (uses.includes("${{")) return { kind: "dynamic" };
+  if (uses.startsWith("*")) {
+    return { kind: "ok", parsed: { uses, action: "", ref: "", anchor: occ.anchor, alias: uses.slice(1), stepAnchor: occ.stepAnchor } };
+  }
+  const { action, ref } = splitUses(uses);
+  return { kind: "ok", parsed: { uses, action, ref, anchor: occ.anchor, stepAnchor: occ.stepAnchor } };
+}
+
+export interface WorkflowParse {
+  refs: ActionRef[];
+  /** True when the file carries a uses key whose value could not be extracted, so its inventory may be incomplete (P-174). */
+  unparsed: boolean;
+}
+
+export function parseWorkflowDetailed(content: string, workflow: string): WorkflowParse {
   const out: ActionRef[] = [];
+  let unparsed = false;
   const lines = content.split(/\r?\n/);
   // YAML anchors and aliases (supported by GitHub Actions since September
   // 2025) are file-local and defined before use. Track both scalar anchors
@@ -193,8 +368,34 @@ export function parseWorkflowContent(content: string, workflow: string): ActionR
   const scalarAnchors = new Map<string, string>();
   const stepAnchors = new Map<string, string>();
   let pendingStepAnchor: string | undefined;
+  let flowDepth = 0;
+  const emitParsed = (parsed: ParsedUses, line: string, lineNo: number): void => {
+    // Resolve an alias value to its anchored uses string. An alias whose
+    // anchor is not defined earlier in this file is invalid YAML for
+    // GitHub and is skipped rather than fabricated.
+    let effectiveUses = parsed.uses;
+    let viaAlias = false;
+    if (parsed.alias) {
+      const target = scalarAnchors.get(parsed.alias);
+      if (!target) {
+        pendingStepAnchor = undefined;
+        return;
+      }
+      effectiveUses = target;
+      viaAlias = true;
+    }
+    if (parsed.anchor) scalarAnchors.set(parsed.anchor, effectiveUses);
+    if (parsed.stepAnchor) stepAnchors.set(parsed.stepAnchor, effectiveUses);
+    else if (pendingStepAnchor) {
+      stepAnchors.set(pendingStepAnchor, effectiveUses);
+      pendingStepAnchor = undefined;
+    }
+    out.push(buildActionRef(effectiveUses, workflow, lineNo, line, viaAlias));
+  };
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+    const depthAtStart = flowDepth;
+    flowDepth = Math.max(0, flowDepth + flowDepthDelta(line));
     // A step alias (- *name on its own line) reuses an anchored step.
     const stepAlias = /^\s*-\s*\*(\S+)\s*$/.exec(line);
     if (stepAlias) {
@@ -212,35 +413,56 @@ export function parseWorkflowContent(content: string, workflow: string): ActionR
     }
     const isStepStart = /^\s*-\s/.test(line);
     const parsed = parseUsesLine(line);
-    if (!parsed) {
+    const occs = scanUsesOccurrences(line, depthAtStart);
+    // The block parser's key position on this line, when it matched, so
+    // its scanner occurrence can be deduped against the flow entries.
+    let blockOcc: UsesOccurrence | undefined;
+    if (parsed) {
+      const bm = /^(\s*(?:-\s*)?(?:&\S+\s+)?)uses/.exec(line);
+      if (bm) blockOcc = occs.find((o) => o.start === bm[1].length);
+    }
+    const flowOccs = blockOcc ? occs.filter((o) => o !== blockOcc) : occs;
+    if (parsed && flowOccs.length === 0) {
+      // The established block-style path, unchanged: the only uses key
+      // on the line sits at a block position.
+      emitParsed(parsed, line, i + 1);
+      continue;
+    }
+    if (!parsed && occs.length === 0) {
+      // A block-position uses key with no extractable value: the block
+      // parser returned null. That is a dynamic value (explained and
+      // documented) unless the value is simply absent, which is a file
+      // the audit cannot inventory.
+      const blockKey = /^\s*(?:-\s*)?(?:&\S+\s+)?uses\s*:\s*(.*)$/.exec(line);
+      if (blockKey) {
+        const rest = blockKey[1].trim();
+        if (!rest) unparsed = true;
+      }
       // A new step dash ends the previous step, so a pending step anchor
       // that never reached a uses line is dead.
       if (isStepStart) pendingStepAnchor = undefined;
       continue;
     }
-    // Resolve an alias value to its anchored uses string. An alias whose
-    // anchor is not defined earlier in this file is invalid YAML for
-    // GitHub and is skipped rather than fabricated.
-    let effectiveUses = parsed.uses;
-    let viaAlias = false;
-    if (parsed.alias) {
-      const target = scalarAnchors.get(parsed.alias);
-      if (!target) {
-        pendingStepAnchor = undefined;
+    // P-174 flow path: every remaining candidate uses occurrence on
+    // the line is inventoried, in order, with the same anchor, alias,
+    // and dynamic handling as block entries. The block entry, when
+    // present, sits at the line start and is emitted first.
+    if (parsed) emitParsed(parsed, line, i + 1);
+    for (const occ of flowOccs) {
+      const fv = parseFlowValue(occ);
+      if (fv.kind === "empty") {
+        unparsed = true;
         continue;
       }
-      effectiveUses = target;
-      viaAlias = true;
+      if (fv.kind === "dynamic") continue;
+      emitParsed(fv.parsed, line, i + 1);
     }
-    if (parsed.anchor) scalarAnchors.set(parsed.anchor, effectiveUses);
-    if (parsed.stepAnchor) stepAnchors.set(parsed.stepAnchor, effectiveUses);
-    else if (pendingStepAnchor) {
-      stepAnchors.set(pendingStepAnchor, effectiveUses);
-      pendingStepAnchor = undefined;
-    }
-    out.push(buildActionRef(effectiveUses, workflow, i + 1, line, viaAlias));
   }
-  return out;
+  return { refs: out, unparsed };
+}
+
+export function parseWorkflowContent(content: string, workflow: string): ActionRef[] {
+  return parseWorkflowDetailed(content, workflow).refs;
 }
 
 export function computeVerdict(actions: ActionRef[]): Verdict {
@@ -400,11 +622,18 @@ export function auditWorkflows(rootPath: string): AuditReport {
   }
   const files = discoverWorkflows(rootPath);
   const actions: ActionRef[] = [];
+  // P-174: a file whose uses entries could not all be extracted is
+  // named in unparsedWorkflows, carries a note, and floors the
+  // verdict at PARTIAL, so it never silently contributes zero actions
+  // to a PINNED verdict.
+  const unparsedWorkflows: string[] = [];
   for (const f of files) {
     // Defense in depth behind discovery (P-077): never open a path
     // whose stat type is not a regular file.
     if (!isRegularFile(f)) continue;
-    actions.push(...parseWorkflowContent(readFileSync(f, "utf8"), f));
+    const parsedFile = parseWorkflowDetailed(readFileSync(f, "utf8"), f);
+    actions.push(...parsedFile.refs);
+    if (parsedFile.unparsed) unparsedWorkflows.push(f);
   }
   // P-058: a directory audit also audits the composite action
   // definitions that live inside the scanned repo: every action file
@@ -447,7 +676,9 @@ export function auditWorkflows(rootPath: string): AuditReport {
       if (!isRegularFile(file)) continue;
       seen.add(key);
       composites.push(file);
-      const refs = parseWorkflowContent(readFileSync(file, "utf8"), file);
+      const parsedComposite = parseWorkflowDetailed(readFileSync(file, "utf8"), file);
+      if (parsedComposite.unparsed && !unparsedWorkflows.includes(file)) unparsedWorkflows.push(file);
+      const refs = parsedComposite.refs;
       for (const r of refs) {
         r.composite = true;
         actions.push(r);
@@ -472,9 +703,11 @@ export function auditWorkflows(rootPath: string): AuditReport {
     thirdParty: actions.filter((a) => a.ownerType === "third-party").length,
     docker: actions.filter((a) => a.ownerType === "docker").length,
   };
+  let verdict = computeVerdict(actions);
+  if (unparsedWorkflows.length > 0 && verdict === "PINNED") verdict = "PARTIAL";
   const report: AuditReport = {
     path: rootPath,
-    verdict: computeVerdict(actions),
+    verdict,
     actions,
     counts,
     workflows: files,
@@ -482,7 +715,12 @@ export function auditWorkflows(rootPath: string): AuditReport {
     checkedAt: new Date().toISOString(),
   };
   if (unscannedComposites.length > 0) report.unscannedComposites = unscannedComposites;
-  if (files.length === 0 && composites.length === 0) {
+  if (unparsedWorkflows.length > 0) {
+    report.unparsedWorkflows = unparsedWorkflows;
+    report.note =
+      `${unparsedWorkflows.length} workflow file(s) could not be fully parsed and may contain uses entries that were not inventoried: ${unparsedWorkflows.join(", ")}. ` +
+      "The verdict is floored at PARTIAL and does not cover those files; fix the file or rewrite it in block style and audit again.";
+  } else if (files.length === 0 && composites.length === 0) {
     // P-014: PINNED over zero workflows is vacuously true and was read as
     // an all-clear on real repos with no workflows directory at all
     // (kubernetes/kubernetes in Round 1 validation). Say so in the report
@@ -564,14 +802,28 @@ export function actionRepo(action: string): { owner: string; repo: string } | nu
 /** Build the rewritten line for a pinned action, preserving indentation and content. */
 export function buildPinnedLine(rawLine: string, actionRef: ActionRef, sha: string): string {
   const needle = `${actionRef.action}@${actionRef.ref}`;
+  // P-174: on a flow-style line, content follows the uses value on the
+  // same line (a comma, a closing brace or bracket, or a sibling
+  // entry). The usual trailing version comment is a YAML comment there:
+  // it would comment out the rest of the line and corrupt the flow
+  // collection, so a flow line is pinned without a comment.
+  const isFlowTail = (tail: string): boolean => /^\s*[,}\]]/.test(tail);
   // A quoted uses value must keep its closing quote before the version
   // comment, or the comment becomes part of the quoted string and corrupts
   // the action reference.
   for (const q of ['"', "'"]) {
     const quoted = `${q}${needle}${q}`;
-    if (rawLine.includes(quoted)) {
+    const at = rawLine.indexOf(quoted);
+    if (at >= 0) {
+      const tail = rawLine.slice(at + quoted.length);
+      if (isFlowTail(tail)) return rawLine.replace(quoted, `${q}${actionRef.action}@${sha}${q}`);
       return rawLine.replace(quoted, `${q}${actionRef.action}@${sha}${q} # ${actionRef.ref}`);
     }
+  }
+  const at = rawLine.indexOf(needle);
+  if (at >= 0) {
+    const tail = rawLine.slice(at + needle.length);
+    if (isFlowTail(tail)) return rawLine.replace(needle, `${actionRef.action}@${sha}`);
   }
   const replacement = `${actionRef.action}@${sha} # ${actionRef.ref}`;
   if (rawLine.includes(needle)) return rawLine.replace(needle, replacement);
@@ -584,6 +836,8 @@ export async function buildPinPlan(rootPath: string, fetchFn: FetchFn): Promise<
   const entries: PinPlanEntry[] = [];
   // Cache resolutions per owner/repo@ref.
   const cache = new Map<string, string>();
+  // Planned text per workflow line, chained for shared flow lines.
+  const lineState = new Map<string, string>();
   for (const a of report.actions) {
     if (a.classification === "LOCAL") {
       entries.push({ workflow: a.workflow, line: a.line, action: a.action, oldRef: a.ref, originalLine: a.rawLine, status: "local" });
@@ -616,7 +870,14 @@ export async function buildPinPlan(rootPath: string, fetchFn: FetchFn): Promise<
         sha = await resolveRefToSha(fetchFn, repoRef.owner, repoRef.repo, a.ref);
         cache.set(key, sha);
       }
-      const newLine = buildPinnedLine(a.rawLine, a, sha);
+      // P-174: several flow entries can share one line. Chain the
+      // rewrite through the line's current planned text so each
+      // entry's newLine carries every earlier pin on that line, and
+      // applying the entries in order leaves all of them pinned.
+      const lineKey = `${a.workflow}:${a.line}`;
+      const baseLine = lineState.get(lineKey) ?? a.rawLine;
+      const newLine = buildPinnedLine(baseLine, a, sha);
+      lineState.set(lineKey, newLine);
       entries.push({ workflow: a.workflow, line: a.line, action: a.action, oldRef: a.ref, newRef: sha, sha, originalLine: a.rawLine, newLine, status: "pinned" });
     } catch (err) {
       entries.push({ workflow: a.workflow, line: a.line, action: a.action, oldRef: a.ref, originalLine: a.rawLine, status: "failed", error: err instanceof Error ? err.message : String(err) });
@@ -683,7 +944,7 @@ export function renderReport(report: AuditReport): string {
     lines.push(`  [${a.classification}] ${a.workflow}:${a.line} ${a.uses} (${a.ownerType})${a.composite ? " [composite action]" : ""}`);
     if (a.note) lines.push(`    NOTE: ${a.note}`);
   }
-  if (report.note) lines.push("No workflows were audited, so no pinning conclusion applies to this path.");
+  if (report.workflows.length === 0 && (!report.composites || report.composites.length === 0)) lines.push("No workflows were audited, so no pinning conclusion applies to this path.");
   else if (report.verdict === "PINNED") lines.push("PINNED: every non-local action is pinned to a full commit SHA.");
   else if (report.verdict === "EXPOSED") lines.push("EXPOSED: at least one third-party or container action uses a mutable tag or branch ref.");
   else lines.push("PARTIAL: some official actions use mutable or branch refs, no third-party exposure found.");
